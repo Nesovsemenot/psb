@@ -339,30 +339,34 @@ def load_targets(scope: str) -> list:
     return targets
 
 
-def cmd_scan(args):
-    targets = load_targets(args.scope)
-    print(f"Сканирую {len(targets)} целей (scope={args.scope}, "
-          f"парсер={'cryptography' if HAVE_CRYPTOGRAPHY else 'openssl'})…\n", file=sys.stderr)
-
+def run_scan(scope="top25", workers=16, timeout=8.0, date=None, out=None, progress=None):
+    """Сканирует цели и сохраняет снимок. progress(done, total, result) — колбэк.
+    Возвращает (snapshot, path)."""
+    targets = load_targets(scope)
     results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futures = {ex.submit(scan_target, t, args.timeout): t for t in targets}
+    done = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(scan_target, t, timeout): t for t in targets}
         for fut in concurrent.futures.as_completed(futures):
             r = fut.result()
             results.append(r)
-            mark = "✗" if r.get("error") else ("★" if r.get("domestic") else "·")
-            print(f"  {mark} {r['name']:<28} {r.get('ca') or 'ОШИБКА'}", file=sys.stderr)
+            done += 1
+            if progress:
+                try:
+                    progress(done, len(targets), r)
+                except Exception:
+                    pass
 
     order = {t["name"]: i for i, t in enumerate(targets)}
     results.sort(key=lambda r: order.get(r["name"], 999))
 
     os.makedirs(SNAP_DIR, exist_ok=True)
-    date = args.date or dt.date.today().isoformat()
-    path = args.out or os.path.join(SNAP_DIR, f"{date}.json")
+    date = date or dt.date.today().isoformat()
+    path = out or os.path.join(SNAP_DIR, f"{date}.json")
     snapshot = {
         "date": date,
         "scanned_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
-        "scope": args.scope,
+        "scope": scope,
         "parser": "cryptography" if HAVE_CRYPTOGRAPHY else "openssl",
         "total": len(results),
         "ok": sum(1 for r in results if not r.get("error")),
@@ -370,32 +374,57 @@ def cmd_scan(args):
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(snapshot, f, ensure_ascii=False, indent=2)
+    return snapshot, path
 
+
+def cmd_scan(args):
+    targets = load_targets(args.scope)
+    print(f"Сканирую {len(targets)} целей (scope={args.scope}, "
+          f"парсер={'cryptography' if HAVE_CRYPTOGRAPHY else 'openssl'})…\n", file=sys.stderr)
+
+    def progress(done, total, r):
+        mark = "✗" if r.get("error") else ("★" if r.get("domestic") else "·")
+        print(f"  {mark} {r['name']:<28} {r.get('ca') or 'ОШИБКА'}", file=sys.stderr)
+
+    snapshot, path = run_scan(args.scope, args.workers, args.timeout,
+                              args.date, args.out, progress)
     print(f"\nСнимок сохранён: {path}", file=sys.stderr)
-    print_summary(snapshot)
+    print(summary_text(snapshot))
     return path
 
 
-def print_summary(snap: dict):
+def summary_text(snap: dict, verbose=True) -> str:
     ok = [r for r in snap["results"] if not r.get("error")]
     errs = [r for r in snap["results"] if r.get("error")]
     by_ca = {}
     for r in ok:
         by_ca.setdefault(r["ca"], []).append(r["name"])
 
-    print(f"\n=== Снимок {snap['date']}: {len(ok)}/{snap['total']} успешно ===")
+    L = [f"Снимок {snap['date']}: {len(ok)}/{snap['total']} успешно "
+         f"(scope={snap.get('scope', '?')})", ""]
     for ca, names in sorted(by_ca.items(), key=lambda kv: (-len(kv[1]), kv[0])):
-        print(f"{ca:<24} {len(names):>3}  {', '.join(names)}")
-    soon = sorted([r for r in ok if (r.get("days_left") or 999) < 30],
+        line = f"{ca} — {len(names)}"
+        if verbose:
+            line += f": {', '.join(names)}"
+        L.append(line)
+
+    soon = sorted([r for r in ok if (r.get("days_left") is not None and r["days_left"] < 30)],
                   key=lambda r: r["days_left"])
     if soon:
-        print("\nИстекают в ближайшие 30 дней:")
+        L.append("")
+        L.append("Истекают в ближайшие 30 дней:")
         for r in soon:
-            print(f"  {r['name']} ({r['domain']}) — {r['days_left']} дн., до {r['not_after']}")
+            L.append(f"  {r['name']} ({r['domain']}) — {r['days_left']} дн., до {r['not_after']}")
     if errs:
-        print(f"\nНе удалось проверить ({len(errs)}):")
+        L.append("")
+        L.append(f"Не удалось проверить ({len(errs)}):")
         for r in errs:
-            print(f"  {r['name']}: {r['error'][:120]}")
+            L.append(f"  {r['name']}: {r['error'][:120]}")
+    return "\n".join(L)
+
+
+def print_summary(snap: dict):
+    print("\n=== " + summary_text(snap))
 
 
 # --------------------------------------------------------------------------
