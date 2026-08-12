@@ -32,6 +32,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import time
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SNAP_DIR = os.path.join(BASE_DIR, "snapshots")
@@ -99,24 +100,101 @@ def to_ascii_host(host: str) -> str:
         return host
 
 
-def fetch_der(host: str, port: int = 443, timeout: float = 8.0):
-    """Возвращает (der_bytes, tls_version, cipher, trusted_by_system)."""
-    ahost = to_ascii_host(host)
+CA_BUNDLE_PATH = os.path.join(BASE_DIR, ".ca_bundle.pem")
+_CA_BUNDLE_CACHE = []
 
+
+def macos_ca_bundle():
+    """Собирает доверенные корни из связок ключей macOS в один .pem.
+
+    Python не умеет читать Keychain напрямую, поэтому свои сертификаты
+    (корень корпоративного прокси, НУЦ Минцифры и т.п.) он не видит.
+    Собираем бандл сами — один раз в сутки.
+    """
+    if _CA_BUNDLE_CACHE:
+        return _CA_BUNDLE_CACHE[0]
+    if sys.platform != "darwin":
+        return None
+    fresh = (os.path.exists(CA_BUNDLE_PATH) and
+             time.time() - os.path.getmtime(CA_BUNDLE_PATH) < 86400 and
+             os.path.getsize(CA_BUNDLE_PATH) > 1000)
+    if not fresh:
+        keychains = [
+            "/System/Library/Keychains/SystemRootCertificates.keychain",
+            "/Library/Keychains/System.keychain",
+            os.path.expanduser("~/Library/Keychains/login.keychain-db"),
+        ]
+        chunks = []
+        for k in keychains:
+            if not os.path.exists(k):
+                continue
+            try:
+                out = subprocess.run(["security", "find-certificate", "-a", "-p", k],
+                                     capture_output=True, text=True, timeout=30).stdout
+                if "BEGIN CERTIFICATE" in out:
+                    chunks.append(out)
+            except Exception:
+                pass
+        if not chunks:
+            return None
+        try:
+            with open(CA_BUNDLE_PATH, "w", encoding="utf-8") as f:
+                f.write("\n".join(chunks))
+        except OSError:
+            return None
+    _CA_BUNDLE_CACHE.append(CA_BUNDLE_PATH)
+    return CA_BUNDLE_PATH
+
+
+def trusting_context():
+    """Обычный проверяющий контекст, но с корнями из Keychain."""
+    ctx = ssl.create_default_context()
+    bundle = macos_ca_bundle()
+    if bundle:
+        try:
+            ctx.load_verify_locations(cafile=bundle)
+        except Exception:
+            pass
+    return ctx
+
+
+def _client_context(tls12_only=False):
+    """ClientHello, похожий на браузерный: часть сайтов за WAF рвёт
+    соединение с 'нетипичными' клиентами."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
+    # старые серверы без RFC 5746
+    ctx.options |= getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x00000004)
+    try:
+        ctx.set_alpn_protocols(["h2", "http/1.1"])
+    except Exception:
+        pass
+    try:
+        ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
+    except ssl.SSLError:
+        pass
+    if tls12_only:
+        ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+    return ctx
+
+
+def fetch_der(host: str, port: int = 443, timeout: float = 15.0, tls12_only=False):
+    """Возвращает (der_bytes, tls_version, cipher, trusted_by_system)."""
+    ahost = to_ascii_host(host)
+    ctx = _client_context(tls12_only)
 
     with socket.create_connection((ahost, port), timeout=timeout) as sock:
+        sock.settimeout(timeout)
         with ctx.wrap_socket(sock, server_hostname=ahost) as ssock:
             der = ssock.getpeercert(binary_form=True)
             version = ssock.version()
             cipher = ssock.cipher()[0] if ssock.cipher() else None
 
-    # отдельная проверка: доверяет ли цепочке системное хранилище
+    # отдельная проверка: доверяет ли цепочке хранилище системы
     trusted = None
     try:
-        vctx = ssl.create_default_context()
+        vctx = trusting_context()
         with socket.create_connection((ahost, port), timeout=timeout) as sock:
             with vctx.wrap_socket(sock, server_hostname=ahost):
                 trusted = True
@@ -287,9 +365,10 @@ def parse_cert(der: bytes) -> dict:
 def scan_target(target: dict, timeout: float) -> dict:
     domains = [target["domain"]] + list(target.get("alt") or [])
     errors = []
-    for dom in domains:
+    # вторая попытка с потолком TLS 1.2: часть серверов за WAF молчит на 1.3
+    for dom, tls12 in [(d, m) for m in (False, True) for d in domains]:
         try:
-            der, version, cipher, trusted = fetch_der(dom, timeout=timeout)
+            der, version, cipher, trusted = fetch_der(dom, timeout=timeout, tls12_only=tls12)
             if not der:
                 raise RuntimeError("сертификат не получен")
             info = parse_cert(der)
@@ -316,7 +395,8 @@ def scan_target(target: dict, timeout: float) -> dict:
                 **info,
             }
         except Exception as e:
-            errors.append(f"{dom}: {type(e).__name__}: {e}")
+            tag = f"{dom}{' [tls1.2]' if tls12 else ''}"
+            errors.append(f"{tag}: {type(e).__name__}: {e}")
     return {
         "name": target["name"],
         "rank": target.get("rank"),
@@ -339,7 +419,7 @@ def load_targets(scope: str) -> list:
     return targets
 
 
-def run_scan(scope="top25", workers=16, timeout=8.0, date=None, out=None, progress=None):
+def run_scan(scope="top25", workers=16, timeout=15.0, date=None, out=None, progress=None):
     """Сканирует цели и сохраняет снимок. progress(done, total, result) — колбэк.
     Возвращает (snapshot, path)."""
     targets = load_targets(scope)
@@ -642,7 +722,7 @@ def main():
     s.add_argument("--scope", choices=["top25", "banks", "all"], default="top25",
                    help="top25 (по умолчанию) | banks — все банки | all — банки + инфраструктура")
     s.add_argument("--workers", type=int, default=16)
-    s.add_argument("--timeout", type=float, default=8.0)
+    s.add_argument("--timeout", type=float, default=15.0)
     s.add_argument("--date", help="дата снимка (по умолчанию сегодня)")
     s.add_argument("--out", help="путь к файлу снимка")
     s.set_defaults(func=cmd_scan)

@@ -24,6 +24,7 @@ import json
 import mimetypes
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -42,7 +43,7 @@ API = "https://api.telegram.org/bot{token}/{method}"
 MAX_LEN = 3900  # запас к лимиту телеграма в 4096
 
 KEYBOARD = {
-    "keyboard": [["/scan", "/report"], ["/last", "/snapshots"], ["/post", "/help"]],
+    "keyboard": [["/scan", "/report"], ["/last", "/snapshots"], ["/post", "/git"]],
     "resize_keyboard": True,
 }
 
@@ -58,7 +59,8 @@ HELP = """Сканер TLS-сертификатов сайтов российс�
 
 /last — сводка по последнему снимку
 /snapshots — какие снимки есть
-/targets all — список целей"""
+/targets all — список целей
+/git — закоммитить снимки и отчёты и отправить на GitHub"""
 
 
 # --------------------------------------------------------------------------
@@ -85,6 +87,7 @@ def load_config() -> dict:
         "timeout": float(cfg.get("timeout", 8.0)),
         "daily_scan_at": cfg.get("daily_scan_at"),      # "09:00" или null
         "daily_scan_chat_id": cfg.get("daily_scan_chat_id"),
+        "git_autosave": bool(cfg.get("git_autosave", True)),
     }
 
 
@@ -94,12 +97,23 @@ CFG = {}
 # --------------------------------------------------------------------------
 # Telegram API
 # --------------------------------------------------------------------------
+_SSL_CTX = []
+
+
+def tls_context():
+    """Контекст с корнями из Keychain — иначе Python не видит сертификат
+    локального прокси/VPN и падает на CERTIFICATE_VERIFY_FAILED."""
+    if not _SSL_CTX:
+        _SSL_CTX.append(bc.trusting_context())
+    return _SSL_CTX[0]
+
+
 def api(method: str, payload: dict, timeout=70):
     url = API.format(token=CFG["token"], method=method)
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data,
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout, context=tls_context()) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -176,7 +190,7 @@ def send_document(chat_id, path, caption=""):
     req = urllib.request.Request(url, data=body, headers={
         "Content-Type": f"multipart/form-data; boundary={boundary}"})
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=120, context=tls_context()) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except Exception as e:
         print(f"[send_document] {e}", file=sys.stderr)
@@ -186,6 +200,36 @@ def send_document(chat_id, path, caption=""):
 # Команды
 # --------------------------------------------------------------------------
 SCAN_LOCK = threading.Lock()
+REPO_DIR = os.path.dirname(BASE_DIR)
+
+
+def git(*args, timeout=120):
+    r = subprocess.run(["git", "-C", REPO_DIR] + list(args),
+                       capture_output=True, text=True, timeout=timeout)
+    return r.returncode, (r.stdout + r.stderr).strip()
+
+
+def do_git_save(chat_id, message=None, quiet=False):
+    """Коммит и push снимков и отчётов."""
+    if not os.path.isdir(os.path.join(REPO_DIR, ".git")):
+        if not quiet:
+            send_message(chat_id, "Это не git-репозиторий, сохранять некуда.")
+        return
+    msg = message or f"снимок и отчёт за {dt.date.today().isoformat()}"
+    git("add", "cert-scanner/snapshots", "cert-scanner/reports")
+    code, out = git("commit", "-m", msg)
+    if code != 0 and "nothing to commit" in out:
+        if not quiet:
+            send_message(chat_id, "Нечего сохранять — новых файлов нет.")
+        return
+    if code != 0:
+        send_message(chat_id, "Не удалось закоммитить:\n" + out[-1000:])
+        return
+    code, out = git("push")
+    if code == 0:
+        send_message(chat_id, f"Сохранено в git и отправлено на GitHub: {msg}")
+    else:
+        send_message(chat_id, "Коммит сделан, но push не прошёл:\n" + out[-1000:])
 
 
 def resolve_snapshot(arg: str):
@@ -230,6 +274,8 @@ def do_scan(chat_id, scope):
         else:
             send_message(chat_id, "Это первый снимок — сравнивать пока не с чем. "
                                   "Следующий скан даст отчёт о переходах.")
+        if CFG.get("git_autosave"):
+            do_git_save(chat_id, f"скан {snap['date']} (scope={scope})", quiet=True)
     except Exception:
         send_message(chat_id, "Ошибка при сканировании:\n" + traceback.format_exc()[-1500:])
     finally:
@@ -320,6 +366,8 @@ def handle_command(chat_id, text):
         do_last(chat_id)
     elif cmd in ("/snapshots", "/list"):
         do_snapshots(chat_id)
+    elif cmd in ("/git", "/save"):
+        do_git_save(chat_id, " ".join(args) if args else None)
     elif cmd == "/targets":
         scope = args[0] if args and args[0] in ("top25", "banks", "all") else "top25"
         do_targets(chat_id, scope)
