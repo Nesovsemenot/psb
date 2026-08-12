@@ -419,10 +419,26 @@ def load_targets(scope: str) -> list:
     return targets
 
 
-def run_scan(scope="top25", workers=16, timeout=15.0, date=None, out=None, progress=None):
-    """Сканирует цели и сохраняет снимок. progress(done, total, result) — колбэк.
-    Возвращает (snapshot, path)."""
+def run_scan(scope="top25", workers=16, timeout=15.0, date=None, out=None,
+             progress=None, retry_timeout=45.0):
+    """Сканирует цели и сохраняет снимок.
+
+    Сначала быстрый проход в несколько потоков, затем повторная — неспешная и
+    почти последовательная — попытка для тех, кто не ответил: часть банков
+    отвечает медленно или троттлит параллельные подключения.
+
+    progress(done, total, result, phase) — колбэк, phase = "scan" | "retry".
+    Возвращает (snapshot, path).
+    """
     targets = load_targets(scope)
+
+    def notify(done, total, r, phase):
+        if progress:
+            try:
+                progress(done, total, r, phase)
+            except Exception:
+                pass
+
     results = []
     done = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
@@ -431,11 +447,24 @@ def run_scan(scope="top25", workers=16, timeout=15.0, date=None, out=None, progr
             r = fut.result()
             results.append(r)
             done += 1
-            if progress:
-                try:
-                    progress(done, len(targets), r)
-                except Exception:
-                    pass
+            notify(done, len(targets), r, "scan")
+
+    failed = [r for r in results if r.get("error")]
+    if failed and retry_timeout:
+        by_name = {t["name"]: t for t in targets}
+        done = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+            futures = {ex.submit(scan_target, by_name[r["name"]], retry_timeout): r["name"]
+                       for r in failed if r["name"] in by_name}
+            for fut in concurrent.futures.as_completed(futures):
+                r2 = fut.result()
+                done += 1
+                if not r2.get("error"):
+                    for i, r in enumerate(results):
+                        if r["name"] == r2["name"]:
+                            results[i] = r2
+                            break
+                notify(done, len(futures), r2, "retry")
 
     order = {t["name"]: i for i, t in enumerate(targets)}
     results.sort(key=lambda r: order.get(r["name"], 999))
@@ -462,12 +491,13 @@ def cmd_scan(args):
     print(f"Сканирую {len(targets)} целей (scope={args.scope}, "
           f"парсер={'cryptography' if HAVE_CRYPTOGRAPHY else 'openssl'})…\n", file=sys.stderr)
 
-    def progress(done, total, r):
+    def progress(done, total, r, phase="scan"):
         mark = "✗" if r.get("error") else ("★" if r.get("domestic") else "·")
-        print(f"  {mark} {r['name']:<28} {r.get('ca') or 'ОШИБКА'}", file=sys.stderr)
+        pref = "  ↻" if phase == "retry" else f"  {mark}"
+        print(f"{pref} {r['name']:<28} {r.get('ca') or 'ОШИБКА'}", file=sys.stderr)
 
     snapshot, path = run_scan(args.scope, args.workers, args.timeout,
-                              args.date, args.out, progress)
+                              args.date, args.out, progress, args.retry_timeout)
     print(f"\nСнимок сохранён: {path}", file=sys.stderr)
     print(summary_text(snapshot))
     return path
@@ -723,6 +753,8 @@ def main():
                    help="top25 (по умолчанию) | banks — все банки | all — банки + инфраструктура")
     s.add_argument("--workers", type=int, default=16)
     s.add_argument("--timeout", type=float, default=15.0)
+    s.add_argument("--retry-timeout", type=float, default=45.0,
+                   help="таймаут повторной попытки для не ответивших (0 — не повторять)")
     s.add_argument("--date", help="дата снимка (по умолчанию сегодня)")
     s.add_argument("--out", help="путь к файлу снимка")
     s.set_defaults(func=cmd_scan)

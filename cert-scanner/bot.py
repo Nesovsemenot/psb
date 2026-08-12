@@ -62,6 +62,17 @@ HELP = """Сканер TLS-сертификатов сайтов российс�
 /targets all — список целей
 /git — закоммитить снимки и отчёты и отправить на GitHub"""
 
+HELP_VIEWER = """Сканер TLS-сертификатов сайтов российских банков. У вас доступ на просмотр.
+
+/last — сводка по последнему снимку
+/report — сравнить два последних снимка
+/report 2026-07-31 2026-08-12 — сравнить конкретные даты
+/post — только текст поста
+/snapshots — какие снимки есть
+/targets all — список целей
+
+Запускать проверку может только владелец бота."""
+
 
 # --------------------------------------------------------------------------
 # Конфигурация
@@ -82,6 +93,9 @@ def load_config() -> dict:
     return {
         "token": token,
         "allowed_user_ids": [int(x) for x in allowed],
+        # только чтение: снимки и отчёты видят, скан и git запустить не могут
+        "viewer_user_ids": [int(x) for x in (cfg.get("viewer_user_ids") or [])],
+        "retry_timeout": float(cfg.get("retry_timeout", 45.0)),
         "default_scope": cfg.get("default_scope", "top25"),
         "workers": int(cfg.get("workers", 16)),
         "timeout": float(cfg.get("timeout", 8.0)),
@@ -200,6 +214,7 @@ def send_document(chat_id, path, caption=""):
 # Команды
 # --------------------------------------------------------------------------
 SCAN_LOCK = threading.Lock()
+KNOCKED = set()          # чужие id, о которых владелец уже предупреждён
 REPO_DIR = os.path.dirname(BASE_DIR)
 
 
@@ -253,15 +268,20 @@ def do_scan(chat_id, scope):
                               keyboard=False)
         state = {"last": 0.0}
 
-        def progress(done, tot, r):
+        def progress(done, tot, r, phase="scan"):
             now = time.time()
             if now - state["last"] > 3 or done == tot:
                 state["last"] = now
-                edit_message(chat_id, msg_id, f"Проверяю {tot} сайтов (scope={scope})…\n"
-                                              f"Готово: {done}/{tot}")
+                if phase == "retry":
+                    text = (f"Проверено {total} сайтов.\n"
+                            f"Повторная попытка для не ответивших: {done}/{tot}")
+                else:
+                    text = f"Проверяю {tot} сайтов (scope={scope})…\nГотово: {done}/{tot}"
+                edit_message(chat_id, msg_id, text)
 
         started = time.time()
-        snap, path = bc.run_scan(scope, CFG["workers"], CFG["timeout"], progress=progress)
+        snap, path = bc.run_scan(scope, CFG["workers"], CFG["timeout"],
+                                 progress=progress, retry_timeout=CFG["retry_timeout"])
         took = int(time.time() - started)
         edit_message(chat_id, msg_id, f"Проверка завершена за {took} с.")
         send_message(chat_id, bc.summary_text(snap, verbose=True))
@@ -342,13 +362,22 @@ def do_targets(chat_id, scope):
     send_message(chat_id, f"Цели ({scope}, {len(targets)}):\n\n" + "\n".join(lines))
 
 
-def handle_command(chat_id, text):
+WRITE_COMMANDS = ("/scan", "/git", "/save")
+
+
+def handle_command(chat_id, text, readonly=False):
     parts = text.strip().split()
     cmd = parts[0].lower().split("@")[0]
     args = parts[1:]
 
+    if readonly and cmd in WRITE_COMMANDS:
+        send_message(chat_id, "У вас доступ только на просмотр: смотреть снимки и отчёты "
+                              "можно, запускать проверку — нет.\n\n"
+                              "/last, /report, /post, /snapshots, /targets")
+        return
+
     if cmd in ("/start", "/help"):
-        send_message(chat_id, HELP)
+        send_message(chat_id, HELP_VIEWER if readonly else HELP)
     elif cmd == "/scan":
         scope = args[0] if args and args[0] in ("top25", "banks", "all") else CFG["default_scope"]
         threading.Thread(target=do_scan, args=(chat_id, scope), daemon=True).start()
@@ -427,9 +456,19 @@ def main():
                     continue
 
                 allowed = CFG["allowed_user_ids"]
-                if allowed and user.get("id") not in allowed:
+                viewers = CFG["viewer_user_ids"]
+                uid = user.get("id")
+                readonly = bool(allowed) and uid not in allowed and uid in viewers
+                if allowed and uid not in allowed and not readonly:
                     send_message(chat_id, "Доступ закрыт.", keyboard=False)
-                    print(f"Отказ: {user.get('id')} ({user.get('username')})")
+                    print(f"Отказ: {uid} ({user.get('username')})")
+                    if uid not in KNOCKED:
+                        KNOCKED.add(uid)
+                        send_message(allowed[0],
+                                     f"В бота постучался @{user.get('username') or '—'} "
+                                     f"(id {uid}).\nЧтобы пустить его на просмотр, добавьте "
+                                     f"{uid} в viewer_user_ids в config.json и перезапустите бота.",
+                                     silent=True)
                     continue
                 if not allowed:
                     send_message(chat_id,
@@ -438,9 +477,10 @@ def main():
                                  f"и перезапустите бота.", keyboard=False)
                     continue
 
-                print(f"[{dt.datetime.now():%H:%M:%S}] {user.get('username')}: {text}")
+                print(f"[{dt.datetime.now():%H:%M:%S}] {user.get('username')}"
+                      f"{' (просмотр)' if readonly else ''}: {text}")
                 try:
-                    handle_command(chat_id, text)
+                    handle_command(chat_id, text, readonly=readonly)
                 except Exception:
                     traceback.print_exc()
                     send_message(chat_id, "Ошибка:\n" + traceback.format_exc()[-1500:])

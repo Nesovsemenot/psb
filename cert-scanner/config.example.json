@@ -1,9 +1,11 @@
 {
   "token": "12345678:AA...ваш-токен-от-BotFather",
   "allowed_user_ids": [],
+  "viewer_user_ids": [],
   "default_scope": "top25",
   "workers": 16,
   "timeout": 15.0,
+  "retry_timeout": 45.0,
   "daily_scan_at": null,
   "daily_scan_chat_id": null,
   "git_autosave": true
