@@ -1,0 +1,15 @@
+# macOS
+.DS_Store
+
+# временные файлы Office
+~$*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# логи и локальные выгрузки
+*.log
+*.zip
