@@ -1,6 +1,6 @@
 {
   "date": "2026-08-12",
-  "scanned_at": "2026-08-12T12:19:45+03:00",
+  "scanned_at": "2026-08-12T12:34:51+03:00",
   "scope": "top25",
   "parser": "openssl",
   "total": 25,
@@ -408,7 +408,7 @@
       "group": "bank",
       "domain": "www.akbars.ru",
       "ca": null,
-      "error": "www.akbars.ru: gaierror: [Errno 8] nodename nor servname provided, or not known | akbars.ru: TimeoutError: _ssl.c:1015: The handshake operation timed out | www.akbars.ru [tls1.2]: TimeoutError: _ssl.c:1015: The handshake operation timed out | akbars.ru [tls1.2]: TimeoutError: _ssl.c:1015: The handshake operation timed out"
+      "error": "www.akbars.ru: TimeoutError: _ssl.c:1015: The handshake operation timed out | akbars.ru: TimeoutError: _ssl.c:1015: The handshake operation timed out | www.akbars.ru [tls1.2]: TimeoutError: _ssl.c:1015: The handshake operation timed out | akbars.ru [tls1.2]: TimeoutError: _ssl.c:1015: The handshake operation timed out"
     },
     {
       "name": "МТС Банк",
