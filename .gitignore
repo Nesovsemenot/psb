@@ -1,0 +1,28 @@
+# Яндекс Метрика — промежуточный кэш (пересобирается скриптом)
+cache_events.json
+
+# Итоговый отчёт (генерируется, не хранится в git)
+psb_events_with_ai.xlsx
+
+# Входной маппинг — если из приватного гугл-дока, положи локально, но не в git
+mapping.xlsx
+
+# Токены и секреты
+.env
+*.token
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
