@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+
+# временные файлы Office
+~$*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# логи и локальные выгрузки
+*.log
+*.zip
+
+# секреты — токен бота лежит здесь, в репозиторий не попадает
+config.json
+.env
+
+# собранный из Keychain бандл корневых сертификатов
+.ca_bundle.pem
